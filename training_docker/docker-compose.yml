@@ -1,0 +1,40 @@
+services:
+  train:
+    build: .
+    image: codebert-vuln-train:latest
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # Rutas dentro del contenedor — ajustar solo si se cambian los volúmenes
+      - TRAIN_CSV=/data/train_functions.csv
+      - TEST_CSV=/data/test_functions.csv
+      - OUTPUT_DIR=/runs/optimized_codebert
+      - NUM_WORKERS=4
+    volumes:
+      # Datasets de entrada (solo lectura) — poner train/test_functions.csv en esta carpeta
+      - ./data:/data:ro
+      # Salida: checkpoints, logs, métricas
+      - ./runs:/runs
+      # Caché de HuggingFace: evita re-descargar codebert-base en cada run
+      - hf_cache:/root/.cache/huggingface
+    # DataLoader con num_workers>0 usa /dev/shm para comunicación entre procesos.
+    # El default de Docker (64 MB) causa crash; 4 GB es más que suficiente.
+    shm_size: "4gb"
+    ulimits:
+      # pin_memory=True en DataLoader requiere memlock sin límite
+      memlock: -1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+volumes:
+  hf_cache:

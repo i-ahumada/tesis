@@ -1,13 +1,11 @@
 import pandas as pd
-from functions.deduplication import compute_md5
-from functions.preprocessing import preprocess_source
 
 
 def check_curated_leakage(
     df: pd.DataFrame,
     curated_path: str,
-    code_col: str = 'source_code',
-    hash_col: str = 'md5_hash',
+    code_col: str = "source_code",
+    hash_col: str = "md5_hash",
 ) -> pd.DataFrame:
     """
     Remueve contratos de df que aparezcan en Smartbugs Curated para evitar
@@ -34,5 +32,5 @@ def check_curated_leakage(
     # print(f'Contratos restantes                          : {len(df)}')
     # return df
 
-    print('Data leakage check: PENDIENTE — Smartbugs Curated no disponible.')
+    print("Data leakage check: PENDIENTE — Smartbugs Curated no disponible.")
     return df

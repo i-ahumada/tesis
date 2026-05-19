@@ -1,2 +1,11 @@
 .venv
 __pycache__
+training_kaggle/result/best_model.pt
+training_kaggle/result/checkpoint_last.pt
+
+**/data/
+**/models/
+**/runs/
+
+.ruff_cache/
+errores_ruff.txt

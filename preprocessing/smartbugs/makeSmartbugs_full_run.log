@@ -1,0 +1,30 @@
+============================================================
+SmartBugs Wild Functions Builder - Slither
+============================================================
+Input : datasets/smartbugs_wild.csv
+Output: func_dataset/smartbugs_functions.csv
+Modo   : 4 detectores sobre todos los contratos
+Cargando: datasets/smartbugs_wild.csv
+Contratos totales en CSV: 47451
+Modo sin filtro: procesando todos los 47451 contratos
+
+============================================================
+RESUMEN
+============================================================
+  Re-entrancy                  slither_hit=11211  funcs=18584
+  Timestamp-Dependency         slither_hit=10808  funcs=10957
+  Unhandled-Exceptions         slither_hit= 617  funcs=  296
+  tx.origin                    slither_hit=  73  funcs=   71
+  TOTAL                                      funcs=29908
+  Contratos sin source_code: 120
+  Contratos fallidos (Slither): 0
+  Tiempo: 36867.3s
+
+Guardado: func_dataset/smartbugs_functions.csv (29908 filas)
+
+Distribucion por vulnerabilidad:
+vulnerability
+Re-entrancy             18584
+Timestamp-Dependency    10957
+Unhandled-Exceptions      296
+tx.origin                  71

@@ -1,7 +1,7 @@
 import pandas as pd
 
 
-def print_class_balance(df: pd.DataFrame, labels_col: str = 'accepted_labels') -> None:
+def print_class_balance(df: pd.DataFrame, labels_col: str = "accepted_labels") -> None:
     """
     Imprime el balance de clases post-cleaning.
 
@@ -15,10 +15,10 @@ def print_class_balance(df: pd.DataFrame, labels_col: str = 'accepted_labels') -
             label_counts[label] = label_counts.get(label, 0) + 1
 
     total = len(df)
-    print('=== Balance de clases (post-cleaning) ===')
+    print("=== Balance de clases (post-cleaning) ===")
     for label, count in sorted(label_counts.items(), key=lambda x: -x[1]):
-        print(f'  {label.ljust(25)} {count:>6}  ({100 * count / total:.1f}%)')
+        print(f"  {label.ljust(25)} {count:>6}  ({100 * count / total:.1f}%)")
 
-    print(f'\nTotal contratos  : {total}')
+    print(f"\nTotal contratos  : {total}")
     avg_labels = sum(len(ls) for ls in df[labels_col]) / total
-    print(f'Labels / contrato: {avg_labels:.2f} (promedio)')
+    print(f"Labels / contrato: {avg_labels:.2f} (promedio)")
