@@ -1,0 +1,71 @@
+{
+  "timestamp_utc": "2026-05-16T00:36:06.156070Z",
+  "timestamp_local": "2026-05-15T21:36:06.155750",
+  "os": {
+    "system": "Windows",
+    "release": "11",
+    "version": "10.0.26200",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 25 Model 80 Stepping 0, AuthenticAMD",
+    "node": "admin_user"
+  },
+  "cpu": {
+    "physical_cores": 8,
+    "logical_cores": 16,
+    "freq_mhz": 3801.0
+  },
+  "ram": {
+    "total_gb": 29.95,
+    "available_gb": 16.88
+  },
+  "python": {
+    "version": "3.14.3",
+    "implementation": "CPython",
+    "compiler": "MSC v.1944 64 bit (AMD64)",
+    "executable": "C:\\Users\\franc\\AppData\\Local\\Python\\PythonCore-3.14-64\\python.exe",
+    "architecture": "64bit"
+  },
+  "libraries": {
+    "pandas": "3.0.3",
+    "numpy": "2.4.5",
+    "slither-analyzer": "0.11.5",
+    "crytic-compile": "0.3.11",
+    "solc-select": "1.2.0",
+    "scikit-learn": "not installed",
+    "torch": "not installed",
+    "transformers": "not installed"
+  },
+  "slither": {
+    "version": "0.11.5",
+    "path": "C:\\Users\\franc\\AppData\\Local\\Python\\PythonCore-3.14-64\\Scripts\\slither.exe"
+  },
+  "solc": {
+    "active_version": "0.5.17 (current, set by C:/Users/franc/.solc-select/global-version)",
+    "solc_output": "solc, the solidity compiler commandline interface"
+  },
+  "environment_vars": {
+    "PATH": "C:\\Users\\franc\\AppData\\Local\\Programs\\Microsoft VS Code;C:\\Program Files\\Common Files\\Oracle\\Java\\javapath;C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1\\bin\\x64;C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1\\bin;C:\\Windows\\system32;C:\\Windows;C:\\Windows\\System32\\Wbem;C:\\Windows\\...",
+    "APPDATA": "C:\\Users\\franc\\AppData\\Roaming"
+  },
+  "output_csv": {
+    "path": "C:\\Users\\franc\\OneDrive\\Documentos\\tesis\\func_dataset\\solidifi_functions.csv",
+    "rows": 5117,
+    "columns": [
+      "id",
+      "contract_file",
+      "vulnerability",
+      "function_name",
+      "function_code",
+      "dataset"
+    ],
+    "sha256": "1674b40e82c154a7f3395989f046565ce1c61b3d22ae1e37ad387df80af7e445",
+    "vuln_counts": {
+      "tx.origin": 1334,
+      "Unhandled-Exceptions": 1293,
+      "Re-entrancy": 1260,
+      "Timestamp-Dependency": 1230
+    }
+  },
+  "pipeline_processing_time_s": 261.6,
+  "env_capture_time_s": 3.18
+}
