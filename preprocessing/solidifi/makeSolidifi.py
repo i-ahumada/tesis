@@ -117,7 +117,7 @@ def load_bug_log(sol_path: str) -> list:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
-                    loc = int(row.get("loc", ""))
+                    loc = int(row.get("loc", "")) + 1
                     entries.append({"loc": loc, "raw": row})
                 except (ValueError, TypeError):
                     continue
@@ -338,7 +338,9 @@ def build_solidifi_functions_dataset(base_path: str) -> pd.DataFrame:
             tmp_path = None
             slither_lines = set()
             try:
-                with tempfile.NamedTemporaryFile(suffix=".sol", mode="w", encoding="utf-8", delete=False) as tf:
+                with tempfile.NamedTemporaryFile(
+                    suffix=".sol", mode="w", encoding="utf-8", delete=False
+                ) as tf:
                     tf.write(source_clean)
                     tmp_path = tf.name
                 slither_out = run_slither(tmp_path, detectors)
