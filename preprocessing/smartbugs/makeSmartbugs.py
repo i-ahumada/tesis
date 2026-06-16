@@ -147,6 +147,12 @@ def strip_comments(source: str) -> str:
     return source
 
 
+def get_last_contract_name(src_code: str) -> str | None:
+    """Retorna el nombre del ultimo contract/library declarado en el source."""
+    matches = re.findall(r"\b(?:library|contract)\s+(\w+)", src_code)
+    return matches[-1] if matches else None
+
+
 # ---------------------------------------------------------------------------
 # Seleccion automatica de version de solc por pragma
 # ---------------------------------------------------------------------------
@@ -261,14 +267,26 @@ def run_slither(sol_path: str, detectors: list, solc_bin: str) -> dict:
     return {}
 
 
-def get_slither_lines(slither_output: dict, detectors: list) -> set:
-    """Extrae lineas reportadas por Slither para los detectores dados."""
+def get_slither_lines(slither_output: dict, detectors: list, last_contract_name: str = None) -> set:
+    """Extrae lineas reportadas por Slither para los detectores dados.
+
+    Si last_contract_name se provee, solo incluye hallazgos cuya funcion
+    pertenece a ese contrato (filtra librerias auxiliares del mismo archivo).
+    """
     lines = set()
     det_set = set(detectors)
-    for f in slither_output.get("results", {}).get("detectors", []):
-        if f.get("check") not in det_set:
+    for det in slither_output.get("results", {}).get("detectors", []):
+        if det.get("check") not in det_set:
             continue
-        for e in f.get("elements", []):
+        elements = det.get("elements", [])
+        if last_contract_name:
+            func_el = next((e for e in elements if e.get("type") == "function"), None)
+            if func_el is None:
+                continue
+            parent = func_el.get("type_specific_fields", {}).get("parent", {})
+            if parent.get("name") != last_contract_name:
+                continue
+        for e in elements:
             for ln in e.get("source_mapping", {}).get("lines", []):
                 lines.add(ln)
     return lines
@@ -429,14 +447,13 @@ def _process_contracts_for_vulns(
         else:
             src_fmt = src_raw
         src_clean = strip_comments(src_fmt)
+        last_contract_name = get_last_contract_name(src_clean)
         solc_ver = detect_solc_version(src_raw)
 
         tmp_path = None
         slither_results_per_vuln = {}
         try:
-            with tempfile.NamedTemporaryFile(
-                suffix=".sol", mode="w", encoding="utf-8", delete=False
-            ) as tf:
+            with tempfile.NamedTemporaryFile(suffix=".sol", mode="w", encoding="utf-8", delete=False) as tf:
                 tf.write(src_clean)
                 tmp_path = tf.name
 
@@ -447,7 +464,7 @@ def _process_contracts_for_vulns(
             slither_out = run_slither(tmp_path, all_detectors, solc_ver)
 
             for v in target_vulns:
-                lines = get_slither_lines(slither_out, SLITHER_DETECTORS[v])
+                lines = get_slither_lines(slither_out, SLITHER_DETECTORS[v], last_contract_name)
                 slither_results_per_vuln[v] = lines
 
         except Exception:

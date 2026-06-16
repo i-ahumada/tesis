@@ -75,8 +75,29 @@ VULN_CLASSES = [
 # ---------------------------------------------------------------------------
 
 
+def normalize_function_code(code: str) -> str:
+    """
+    Normaliza el formato del código fuente para consistencia entre datasets:
+      - Tabs → 4 espacios
+      - Elimina espacios al final de cada línea
+      - Colapsa líneas consecutivas en blanco a una sola
+      - Elimina líneas en blanco al inicio y final
+    """
+    lines = str(code).expandtabs(4).splitlines()
+    lines = [line.rstrip() for line in lines]
+    normalized = []
+    prev_blank = False
+    for line in lines:
+        is_blank = not line.strip()
+        if is_blank and prev_blank:
+            continue
+        normalized.append(line)
+        prev_blank = is_blank
+    return "\n".join(normalized).strip()
+
+
 def _normalize(code: str) -> str:
-    """Colapsa whitespace para comparación semántica de código."""
+    """Colapsa whitespace para comparación semántica de código (dedup)."""
     return re.sub(r"\s+", " ", str(code)).strip()
 
 
@@ -118,6 +139,11 @@ def build_datasets(
         if missing:
             print(f"\n[ERROR] {name} le faltan columnas: {missing}")
             sys.exit(1)
+
+    # Normalizar formato de código antes del dedup y guardado
+    print("\n[1b/4] Normalizando formato de código...")
+    for df in [df_sb, df_sl, df_sol]:
+        df["function_code"] = df["function_code"].apply(normalize_function_code)
 
     # ----------------------------------------------------------------- test
     print("\n[2/4] Construyendo test set (SolidiFI, sin dedup)...")

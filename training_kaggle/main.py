@@ -47,8 +47,8 @@ from transformers import RobertaModel, RobertaTokenizer
 # =============================================================================
 
 # Rutas — ajustar según el nombre del dataset subido a Kaggle
-TRAIN_CSV = "/kaggle/input/datasets/frmorales/dataset/train_functions.csv"
-TEST_CSV = "/kaggle/input/datasets/frmorales/dataset/test_functions.csv"
+TRAIN_CSV = "/kaggle/input/datasets/frmorales/my-dataset/train_functions.csv"
+TEST_CSV = "/kaggle/input/datasets/frmorales/my-dataset/test_functions.csv"
 OUTPUT_DIR = "/kaggle/working/optimized_codebert"
 
 # Hiperparámetros (Tabla 2, paper)
@@ -72,7 +72,7 @@ VULN_CLASSES = ["Re-entrancy", "Timestamp-Dependency", "Unhandled-Exceptions", "
 NUM_LABELS = len(VULN_CLASSES)
 VULN2IDX = {v: i for i, v in enumerate(VULN_CLASSES)}
 
-SEED = 42        # fija la partición train/val para replicabilidad
+SEED = 42  # fija la partición train/val para replicabilidad
 VAL_SPLIT = 0.2  # 20% de train_functions.csv se reserva para validación interna
 
 # =============================================================================
@@ -173,6 +173,20 @@ class OptimizedCodeBERT(nn.Module):
 # =============================================================================
 # Funciones de entrenamiento y evaluación
 # =============================================================================
+
+
+def compute_class_weights(dataset, num_classes, device):
+    ds = dataset.dataset if hasattr(dataset, "dataset") else dataset
+    indices = dataset.indices if hasattr(dataset, "indices") else range(len(ds))
+
+    labels = torch.stack([ds.labels[i] for i in indices])  # (N, num_classes)
+    total = labels.shape[0]
+
+    cant_clase = labels.sum(dim=0).clamp(min=1)  # evitar div/0
+    weights = (total / (num_classes * cant_clase)).clamp(max=10.0)  # evitar explosión
+
+    print("  pos_weight → " + "  ".join(f"{cls}: {w:.2f}" for cls, w in zip(VULN_CLASSES, weights.cpu())))
+    return weights.to(device)
 
 
 def train_epoch(model, loader, optimizer, criterion, scaler, device, grad_accum):
@@ -283,9 +297,7 @@ def load_checkpoint(path, device):
 
 def _run_cmd(cmd):
     try:
-        return subprocess.check_output(
-            cmd, shell=True, text=True, stderr=subprocess.DEVNULL
-        ).strip()
+        return subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
     except Exception:
         return ""
 
@@ -414,12 +426,8 @@ def build_run_report(
                 ),
                 None,
             ),
-            "avg_epoch_time_s": round(sum(epoch_times) / len(epoch_times), 1)
-            if epoch_times
-            else None,
-            "avg_epoch_time": str(timedelta(seconds=int(sum(epoch_times) / len(epoch_times))))
-            if epoch_times
-            else None,
+            "avg_epoch_time_s": round(sum(epoch_times) / len(epoch_times), 1) if epoch_times else None,
+            "avg_epoch_time": str(timedelta(seconds=int(sum(epoch_times) / len(epoch_times)))) if epoch_times else None,
             "loss_train_final": round(history[-1]["train_loss"], 6) if history else None,
             "loss_val_final": round(history[-1]["loss"], 6) if history else None,
         },
@@ -432,12 +440,8 @@ def build_run_report(
             "per_class": {
                 cls: {
                     "f1": round(f1_score(labels_np[:, i], preds_np[:, i], zero_division=0), 6),
-                    "recall": round(
-                        recall_score(labels_np[:, i], preds_np[:, i], zero_division=0), 6
-                    ),
-                    "precision": round(
-                        precision_score(labels_np[:, i], preds_np[:, i], zero_division=0), 6
-                    ),
+                    "recall": round(recall_score(labels_np[:, i], preds_np[:, i], zero_division=0), 6),
+                    "precision": round(precision_score(labels_np[:, i], preds_np[:, i], zero_division=0), 6),
                     "accuracy": round(float((labels_np[:, i] == preds_np[:, i]).mean()), 6),
                     "support": int(labels_np[:, i].sum()),
                 }
@@ -481,7 +485,9 @@ def main():
         random_state=SEED,
         stratify=full_train_df["vulnerability"],
     )
-    print(f"  Train: {len(train_df):,}  |  Val: {len(val_df):,}  (split {100*(1-VAL_SPLIT):.0f}/{100*VAL_SPLIT:.0f}, seed={SEED}, estratificado)")
+    print(
+        f"  Train: {len(train_df):,}  |  Val: {len(val_df):,}  (split {100 * (1 - VAL_SPLIT):.0f}/{100 * VAL_SPLIT:.0f}, seed={SEED}, estratificado)"
+    )
     print("\n  Distribución train:")
     for cls, n in train_df["vulnerability"].value_counts().items():
         print(f"    {cls:<28}: {n:>6,}  ({100 * n / len(train_df):.1f}%)")
@@ -494,12 +500,8 @@ def main():
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, drop_last=False
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True
-    )
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
     print(f"\n  Batch por paso : {BATCH_SIZE} ({BATCH_SIZE // max(NUM_GPUS, 1)} por GPU)")
     print(f"  Grad accum     : {GRAD_ACCUM}  →  batch efectivo: {BATCH_SIZE * GRAD_ACCUM}")
 
@@ -533,7 +535,8 @@ def main():
         weight_decay=WEIGHT_DECAY,
     )
     scheduler = ExponentialLR(optimizer, gamma=LR_GAMMA)
-    criterion = nn.BCEWithLogitsLoss()
+    class_weights = compute_class_weights(train_ds, 4, DEVICE)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights)
     scaler = GradScaler("cuda")
 
     # -------------------------------------------------------------------------
@@ -553,9 +556,7 @@ def main():
     for epoch in range(1, EPOCHS + 1):
         current_lr = optimizer.param_groups[0]["lr"]
 
-        train_loss = train_epoch(
-            model, train_loader, optimizer, criterion, scaler, DEVICE, GRAD_ACCUM
-        )
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, scaler, DEVICE, GRAD_ACCUM)
         torch.cuda.empty_cache()
         val_metrics, _, _ = evaluate(model, val_loader, criterion, DEVICE)
         torch.cuda.empty_cache()

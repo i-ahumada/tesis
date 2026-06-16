@@ -28,9 +28,7 @@ def filter_by_token_length(
     df = df[df["token_count"] <= max_tokens].reset_index(drop=True)
     n_removed = n_before - len(df)
 
-    print(
-        f"Contratos descartados (> {max_tokens} tokens): {n_removed}  ({100 * n_removed / n_before:.1f}%)"
-    )
+    print(f"Contratos descartados (> {max_tokens} tokens): {n_removed}  ({100 * n_removed / n_before:.1f}%)")
     print(f"Contratos restantes                          : {len(df)}")
     print()
     print(df["token_count"].describe().to_string())
@@ -58,16 +56,12 @@ def truncate_by_token_length(
     n_truncated = (df["token_count"] > max_tokens).sum()
 
     def _truncate(code: str) -> str:
-        ids = tokenizer.encode(
-            code, add_special_tokens=True, truncation=True, max_length=max_tokens
-        )
+        ids = tokenizer.encode(code, add_special_tokens=True, truncation=True, max_length=max_tokens)
         return tokenizer.decode(ids, skip_special_tokens=True)
 
     df[code_col] = df[code_col].apply(_truncate)
 
-    print(
-        f"Contratos truncados (> {max_tokens} tokens): {n_truncated}  ({100 * n_truncated / len(df):.1f}%)"
-    )
+    print(f"Contratos truncados (> {max_tokens} tokens): {n_truncated}  ({100 * n_truncated / len(df):.1f}%)")
     print(f"Total contratos                            : {len(df)}")
     print()
     print(df["token_count"].describe().to_string())

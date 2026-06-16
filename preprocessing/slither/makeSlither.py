@@ -232,6 +232,12 @@ def strip_comments(source: str) -> str:
     return source
 
 
+def get_last_contract_name(src_code: str) -> str | None:
+    """Retorna el nombre del ultimo contract/library declarado en el source."""
+    matches = re.findall(r"\b(?:library|contract)\s+(\w+)", src_code)
+    return matches[-1] if matches else None
+
+
 # ---------------------------------------------------------------------------
 # Carga del dataset
 # ---------------------------------------------------------------------------
@@ -286,23 +292,20 @@ def is_candidate(results_str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def run_slither(source: str) -> list[dict]:
+def run_slither(source: str, last_contract_name: str = None) -> list[dict]:
     """
-    Escribe el source (con comentarios eliminados) en un .sol temporal,
-    detecta la version de solc compatible con el pragma, ejecuta Slither y
-    retorna lista de findings con source_mapping completa:
+    Escribe el source completo (con comentarios eliminados) en un .sol temporal,
+    ejecuta Slither y retorna lista de findings del ultimo contrato:
         [{check, function_name, func_start_line, func_end_line, bug_line}, ...]
 
-    Retorna lista vacia si no hay hallazgos o Slither falla.
-    El source original (con comentarios) se usa para extraer el codigo.
+    Si last_contract_name se provee, solo incluye hallazgos cuya funcion
+    pertenece a ese contrato. Retorna lista vacia si no hay hallazgos o Slither falla.
     """
     src_clean = strip_comments(source)
-    solc_bin = detect_solc_version(source)  # usa el pragma del source original
+    solc_bin = detect_solc_version(source)
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".sol", mode="w", delete=False, encoding="utf-8"
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".sol", mode="w", delete=False, encoding="utf-8") as tmp:
             tmp.write(src_clean)
             tmp_path = tmp.name
 
@@ -341,6 +344,11 @@ def run_slither(source: str) -> list[dict]:
             func_el = next((e for e in elements if e.get("type") == "function"), None)
             if not func_el:
                 continue
+
+            if last_contract_name:
+                parent = func_el.get("type_specific_fields", {}).get("parent", {})
+                if parent.get("name") != last_contract_name:
+                    continue
 
             func_lines = func_el.get("source_mapping", {}).get("lines", [])
             if not func_lines:
@@ -417,9 +425,7 @@ def build_slither_functions_dataset(
     n_total = len(df_raw)
     n_candidates = len(df_candidates)
     print(f"  Total contratos      : {n_total:>8,}")
-    print(
-        f"  Candidatos           : {n_candidates:>8,}  ({100 * n_candidates / max(n_total, 1):.1f}%)"
-    )
+    print(f"  Candidatos           : {n_candidates:>8,}  ({100 * n_candidates / max(n_total, 1):.1f}%)")
 
     if max_contracts:
         df_candidates = df_candidates.head(max_contracts)
@@ -453,7 +459,8 @@ def build_slither_functions_dataset(
             stats["sin_source"] += 1
             continue
 
-        findings = run_slither(source)
+        last_contract_name = get_last_contract_name(source)
+        findings = run_slither(source, last_contract_name=last_contract_name)
 
         if not findings:
             stats["sin_hallazgos"] += 1

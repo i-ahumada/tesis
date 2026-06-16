@@ -96,9 +96,7 @@ def compute_scores(details_str: str, tools_dict: dict, t: float = T) -> dict:
     return scores
 
 
-def assign_labels(
-    details_str: str, tools_dict: dict, mu_c: float = MU_C, t: float = T
-) -> set | None:
+def assign_labels(details_str: str, tools_dict: dict, mu_c: float = MU_C, t: float = T) -> set | None:
     scores = compute_scores(details_str, tools_dict, t=t)
 
     # Aceptamos labels que superen el umbral
@@ -126,9 +124,7 @@ def apply_mcd_filter(
     df["tools_parsed"] = df[tools_col].apply(_safe_get_tools_dict)
 
     # Aplicar cálculos pasando ambos datos
-    df["scores"] = df.apply(
-        lambda row: compute_scores(row[details_col], row["tools_parsed"], t=t), axis=1
-    )
+    df["scores"] = df.apply(lambda row: compute_scores(row[details_col], row["tools_parsed"], t=t), axis=1)
     df["accepted_labels"] = df.apply(
         lambda row: assign_labels(row[details_col], row["tools_parsed"], mu_c=mu_c, t=t), axis=1
     )

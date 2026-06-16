@@ -169,9 +169,7 @@ def capture_env(csv_output_path: str = None) -> dict:
     slither_version = _run(["slither", "--version"])
     info["slither"] = {
         "version": slither_version or "not found",
-        "path": _run(["where", "slither"])
-        if platform.system() == "Windows"
-        else _run(["which", "slither"]),
+        "path": _run(["where", "slither"]) if platform.system() == "Windows" else _run(["which", "slither"]),
     }
 
     # --- solc activo y versiones instaladas (via solc-select) ---
@@ -198,8 +196,7 @@ def capture_env(csv_output_path: str = None) -> dict:
                 solc_bins[ver] = bin_path
 
     info["solc"] = {
-        "active_version": active_solc
-        or (solc_version.split("\n")[0] if solc_version else "unknown"),
+        "active_version": active_solc or (solc_version.split("\n")[0] if solc_version else "unknown"),
         "solc_output": solc_version.split("\n")[0] if solc_version else "not found",
         "installed_versions": installed_versions,
         "binary_paths": solc_bins,
@@ -234,9 +231,7 @@ def capture_env(csv_output_path: str = None) -> dict:
                 "rows": len(df),
                 "columns": list(df.columns),
                 "sha256": _file_hash(csv_output_path),
-                "vuln_counts": df["vulnerability"].value_counts().to_dict()
-                if "vulnerability" in df.columns
-                else {},
+                "vuln_counts": df["vulnerability"].value_counts().to_dict() if "vulnerability" in df.columns else {},
             }
         except Exception as e:
             info["output_csv"] = {"error": str(e)}

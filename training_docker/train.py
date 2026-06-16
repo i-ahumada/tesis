@@ -74,7 +74,7 @@ VULN_CLASSES = ["Re-entrancy", "Timestamp-Dependency", "Unhandled-Exceptions", "
 NUM_LABELS = len(VULN_CLASSES)
 VULN2IDX = {v: i for i, v in enumerate(VULN_CLASSES)}
 
-SEED = 42        # fija la partición train/val para replicabilidad
+SEED = 42  # fija la partición train/val para replicabilidad
 VAL_SPLIT = 0.2  # 20% de train_functions.csv se reserva para validación interna
 
 # =============================================================================
@@ -180,14 +180,26 @@ class OptimizedCodeBERT(nn.Module):
 # =============================================================================
 
 
+def compute_class_weights(dataset, num_classes, device):
+    ds = dataset.dataset if hasattr(dataset, "dataset") else dataset
+    indices = dataset.indices if hasattr(dataset, "indices") else range(len(ds))
+
+    labels = torch.stack([ds.labels[i] for i in indices])  # (N, num_classes)
+    total = labels.shape[0]
+
+    cant_clase = labels.sum(dim=0).clamp(min=1)  # evitar div/0
+    weights = (total / (num_classes * cant_clase)).clamp(max=10.0)  # evitar explosión
+
+    print("  pos_weight → " + "  ".join(f"{cls}: {w:.2f}" for cls, w in zip(VULN_CLASSES, weights.cpu())))
+    return weights.to(device)
+
+
 def train_epoch(model, loader, optimizer, criterion, scaler, grad_accum):
     model.train()
     total_loss = 0.0
     optimizer.zero_grad()
 
-    for step, batch in enumerate(
-        tqdm(loader, desc="  train", leave=False, ncols=90, file=sys.stdout)
-    ):
+    for step, batch in enumerate(tqdm(loader, desc="  train", leave=False, ncols=90, file=sys.stdout)):
         input_ids = batch["input_ids"].to(DEVICE)
         attn_mask = batch["attention_mask"].to(DEVICE)
         labels = batch["labels"].to(DEVICE)
@@ -293,9 +305,7 @@ def load_checkpoint(path):
 
 def _run_cmd(cmd):
     try:
-        return subprocess.check_output(
-            cmd, shell=True, text=True, stderr=subprocess.DEVNULL
-        ).strip()
+        return subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
     except Exception:
         return ""
 
@@ -424,12 +434,8 @@ def build_run_report(
                 ),
                 None,
             ),
-            "avg_epoch_time_s": round(sum(epoch_times) / len(epoch_times), 1)
-            if epoch_times
-            else None,
-            "avg_epoch_time": str(timedelta(seconds=int(sum(epoch_times) / len(epoch_times))))
-            if epoch_times
-            else None,
+            "avg_epoch_time_s": round(sum(epoch_times) / len(epoch_times), 1) if epoch_times else None,
+            "avg_epoch_time": str(timedelta(seconds=int(sum(epoch_times) / len(epoch_times)))) if epoch_times else None,
             "loss_train_final": round(history[-1]["train_loss"], 6) if history else None,
             "loss_val_final": round(history[-1]["loss"], 6) if history else None,
         },
@@ -442,12 +448,8 @@ def build_run_report(
             "per_class": {
                 cls: {
                     "f1": round(f1_score(labels_np[:, i], preds_np[:, i], zero_division=0), 6),
-                    "recall": round(
-                        recall_score(labels_np[:, i], preds_np[:, i], zero_division=0), 6
-                    ),
-                    "precision": round(
-                        precision_score(labels_np[:, i], preds_np[:, i], zero_division=0), 6
-                    ),
+                    "recall": round(recall_score(labels_np[:, i], preds_np[:, i], zero_division=0), 6),
+                    "precision": round(precision_score(labels_np[:, i], preds_np[:, i], zero_division=0), 6),
                     "accuracy": round(float((labels_np[:, i] == preds_np[:, i]).mean()), 6),
                     "support": int(labels_np[:, i].sum()),
                 }
@@ -554,10 +556,7 @@ def generate_report(
         lines.append(f"  {cls:<28} {test_dist.get(cls, 0):>8,}")
 
     lines.append("\n--- HISTORIAL DE ENTRENAMIENTO ---")
-    lines.append(
-        f"  {'Época':>5} {'LR':>10} {'Loss_tr':>10} {'Loss_val':>10} "
-        f"{'F1':>8} {'Acc':>8} {'Tiempo':>10}"
-    )
+    lines.append(f"  {'Época':>5} {'LR':>10} {'Loss_tr':>10} {'Loss_val':>10} {'F1':>8} {'Acc':>8} {'Tiempo':>10}")
     lines.append("  " + "-" * 75)
     for r in history:
         t_str = str(timedelta(seconds=int(r["epoch_time_s"]))) if "epoch_time_s" in r else "-"
@@ -703,7 +702,9 @@ def main():
         random_state=SEED,
         stratify=full_train_df["vulnerability"],
     )
-    log.info(f"  Train: {len(train_df):,}  |  Val: {len(val_df):,}  (split {100*(1-VAL_SPLIT):.0f}/{100*VAL_SPLIT:.0f}, seed={SEED}, estratificado)")
+    log.info(
+        f"  Train: {len(train_df):,}  |  Val: {len(val_df):,}  (split {100 * (1 - VAL_SPLIT):.0f}/{100 * VAL_SPLIT:.0f}, seed={SEED}, estratificado)"
+    )
     log.info("  Distribución train:")
     for cls, n in train_df["vulnerability"].value_counts().items():
         log.info(f"    {cls:<28}: {n:>6,}  ({100 * n / len(train_df):.1f}%)")
@@ -713,15 +714,9 @@ def main():
     test_ds = VulnDataset(TEST_CSV, tokenizer, MAX_LEN)
     log.info(f"  Test (held-out): {len(test_ds):,}  ({TEST_CSV})")
 
-    train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True
-    )
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
     steps_per_epoch = len(train_loader)
     optimizer_steps = steps_per_epoch // GRAD_ACCUM
@@ -751,7 +746,8 @@ def main():
         weight_decay=WEIGHT_DECAY,
     )
     scheduler = ExponentialLR(optimizer, gamma=LR_GAMMA)
-    criterion = nn.BCEWithLogitsLoss()
+    class_weights = compute_class_weights(train_ds, 4, DEVICE)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights)
     scaler = GradScaler("cuda")
 
     # -------------------------------------------------------------------------

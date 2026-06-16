@@ -156,9 +156,7 @@ def compute_scores(tools_dict: dict, t: float = T) -> dict:
     for cat in VULN_CATS:
         acc = 0.0
         for tool in TOOLS:
-            detected = {
-                _normalize_cat(k) for k in tools_dict.get(tool, {}).get("categories", {}).keys()
-            }
+            detected = {_normalize_cat(k) for k in tools_dict.get(tool, {}).get("categories", {}).keys()}
             if cat in detected:
                 rate = EQUAL_RATE if cat in EQUAL_WEIGHT_CATS else MCD[tool][cat]
                 acc += np.exp(rate / (100.0 * t))

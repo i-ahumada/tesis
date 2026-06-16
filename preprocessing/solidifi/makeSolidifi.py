@@ -338,9 +338,7 @@ def build_solidifi_functions_dataset(base_path: str) -> pd.DataFrame:
             tmp_path = None
             slither_lines = set()
             try:
-                with tempfile.NamedTemporaryFile(
-                    suffix=".sol", mode="w", encoding="utf-8", delete=False
-                ) as tf:
+                with tempfile.NamedTemporaryFile(suffix=".sol", mode="w", encoding="utf-8", delete=False) as tf:
                     tf.write(source_clean)
                     tmp_path = tf.name
                 slither_out = run_slither(tmp_path, detectors)
