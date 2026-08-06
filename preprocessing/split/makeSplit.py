@@ -1,292 +1,155 @@
 """
-makeSplit.py
-------------------------------------
-Genera los datasets finales de entrenamiento y test combinando los tres
-datasets individuales producidos por los makeX.py correspondientes.
+makeSplit.py — Genera train_functions.csv y test_functions.csv finales.
 
-Replicación de: Tang et al., Scientific Reports 2023
-  doi: 10.1038/s41598-023-47219-0
+Decisiones de diseño:
+- Test: SolidiFI completo, sin dedup interno (el mismo template inyectado en
+  varios contratos representa casos de test válidos).
+- Train: SmartBugs-Wild + Slither-Audited, con dos deduplicaciones por hash
+  SHA-256 del código con espacios colapsados:
+    1. Entre datasets: se conserva SmartBugs y se eliminan de Slither las
+       funciones cuyo hash ya está en SmartBugs.
+    2. Test → Train: se elimina de train toda función cuyo hash aparece en
+       test, para evitar data leakage.
 
-Pipeline:
-  TEST  : solidifi_functions.csv  →  test_functions.csv  (5,117 funciones)
-          Sin hash dedup: SolidiFI inyecta el mismo template buggy en múltiples
-          contratos; aplicar dedup eliminaría el 87% de los casos válidos.
+Validaciones post-split (run_validations, aplicadas a train y test tras
+generarse los datasets). Cada una es una función independiente que elimina
+las filas problemáticas; para desactivar una, comentar su línea en
+run_validations:
+    1. check_starts_with_function: el código debe iniciar con function,
+       constructor, fallback, receive o modifier.
+    2. check_balanced_braces: nº de '{' debe igualar al de '}'.
+    3. check_txorigin_label: elimina snippets con 'tx.origin' cuya etiqueta
+       no es tx.origin.
+    4. check_timestamp_label: elimina snippets con uso de timestamp
+       (block.timestamp / now, ver _TIMESTAMP_RE) cuya etiqueta no es
+       Timestamp-Dependency.
 
-  TRAIN : smartbugs_functions.csv + slither_functions.csv
-          Cross-dataset hash dedup:
-            1. SmartBugs Wild se mantiene completo (base de referencia).
-            2. Se eliminan de Slither Audited las funciones cuyo hash SHA-256
-               (código normalizado) ya esté presente en SmartBugs.
-            3. Resultado: 29,908 + 22,292 = 52,200 funciones.
-
-  NOTA  : El solapamiento SolidiFI → train (~2%) es informacional. No se
-          filtra, replicando el enfoque del paper.
-
-Uso:
-  # Con rutas por defecto (relativas a este script):
-  python makeSplit.py
-
-  # Con rutas explícitas:
-  python makeSplit.py \\
-      --smartbugs ../smartbugs/smartbugs_functions.csv \\
-      --slither   ../slither/slither_functions.csv \\
-      --solidifi  ../solidifi/solidifi_functions.csv \\
-      --out_dir   .
-
-  # Generar también env_report del split:
-  python makeSplit.py --env_report
-
-Salida:
-  model/train_functions.csv    — 52,200 funciones (SmartBugs + Slither dedup)
-  model/test_functions.csv     — 5,117 funciones  (SolidiFI, sin dedup)
-  model/env_report_split.json  — entorno de ejecución (con --env_report)
+Uso: python makeSplit.py  (requiere haber corrido antes los tres makeX.py)
 """
 
 import hashlib
 import re
-import sys
-import time
 from pathlib import Path
 
 import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Rutas por defecto (relativas a este script en preprocessing/model/)
-# ---------------------------------------------------------------------------
-
 _HERE = Path(__file__).parent
+SMARTBUGS_CSV = _HERE.parent / "smartbugs" / "smartbugs_functions.csv"
+SLITHER_CSV = _HERE.parent / "slither" / "slither_functions.csv"
+SOLIDIFI_CSV = _HERE.parent / "solidifi" / "solidifi_functions.csv"
+TRAIN_CSV = _HERE / "train_functions.csv"
+TEST_CSV = _HERE / "test_functions.csv"
 
-SMARTBUGS_CSV = _HERE / ".." / "smartbugs" / "smartbugs_functions.csv"
-SLITHER_CSV = _HERE / ".." / "slither" / "slither_functions.csv"
-SOLIDIFI_CSV = _HERE / ".." / "solidifi" / "solidifi_functions.csv"
-OUT_DIR = _HERE
-ENV_REPORT = _HERE / "env_report_split.json"
 
-VULN_CLASSES = [
-    "Re-entrancy",
-    "Timestamp-Dependency",
-    "Unhandled-Exceptions",
-    "tx.origin",
-]
+def code_hash(code: str) -> str:
+    return hashlib.sha256(re.sub(r"\s+", " ", str(code)).strip().encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
-# Hash de normalización (mismo criterio que makeSmartbugs/makeSlither)
+# Validaciones post-split
+#
+# Cada validación elimina las filas problemáticas y devuelve el DataFrame
+# filtrado. Se ejecutan sobre train y test tras generarse (run_validations).
+# Para desactivar una validación, comentar su línea dentro de run_validations.
 # ---------------------------------------------------------------------------
 
-
-def normalize_function_code(code: str) -> str:
-    """
-    Normaliza el formato del código fuente para consistencia entre datasets:
-      - Tabs → 4 espacios
-      - Elimina espacios al final de cada línea
-      - Colapsa líneas consecutivas en blanco a una sola
-      - Elimina líneas en blanco al inicio y final
-    """
-    lines = str(code).expandtabs(4).splitlines()
-    lines = [line.rstrip() for line in lines]
-    normalized = []
-    prev_blank = False
-    for line in lines:
-        is_blank = not line.strip()
-        if is_blank and prev_blank:
-            continue
-        normalized.append(line)
-        prev_blank = is_blank
-    return "\n".join(normalized).strip()
+# Usos que dispara el detector 'timestamp' de Slither. Ajustar aquí si se
+# quiere cambiar el criterio de la validación check_timestamp_label.
+_TIMESTAMP_RE = re.compile(r"\bblock\.timestamp\b|\bnow\b")
 
 
-def _normalize(code: str) -> str:
-    """Colapsa whitespace para comparación semántica de código (dedup)."""
-    return re.sub(r"\s+", " ", str(code)).strip()
+# Prefijos válidos para un snippet: los cuatro tipos de función de Solidity
+# (function, constructor, fallback, receive) más modifier, que no es una función
+# pero cuyo cuerpo puede contener las vulnerabilidades objetivo.
+_FUNCTION_PREFIXES = ("function", "constructor", "fallback", "receive", "modifier")
 
 
-def _hash(code: str) -> str:
-    return hashlib.sha256(_normalize(code).encode("utf-8")).hexdigest()
+def check_starts_with_function(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """Elimina snippets cuyo código no inicia con function/constructor/fallback/
+    receive/modifier."""
+    mask_ok = df["function_code"].apply(lambda c: str(c).lstrip().startswith(_FUNCTION_PREFIXES))
+    removed = int((~mask_ok).sum())
+    if removed:
+        print(f"[{name}] formato inválido (no inicia con function/constructor/fallback/receive/modifier): -{removed:,}")
+    return df[mask_ok].reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# Pipeline principal
-# ---------------------------------------------------------------------------
+def check_balanced_braces(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """Elimina snippets con llaves desbalanceadas ('{' != '}')."""
+    mask_ok = df["function_code"].apply(lambda c: str(c).count("{") == str(c).count("}"))
+    removed = int((~mask_ok).sum())
+    if removed:
+        print(f"[{name}] llaves desbalanceadas: -{removed:,}")
+    return df[mask_ok].reset_index(drop=True)
 
 
-def build_datasets(
-    smartbugs_csv: Path,
-    slither_csv: Path,
-    solidifi_csv: Path,
-    out_dir: Path,
-) -> tuple:
-    """
-    Retorna (train_df, test_df) y guarda los CSVs en out_dir.
-    """
-    t_total = time.time()
-
-    # ------------------------------------------------------------------ carga
-    print("\n[1/4] Cargando CSVs de entrada...")
-    df_sb = pd.read_csv(smartbugs_csv, encoding="utf-8")
-    df_sl = pd.read_csv(slither_csv, encoding="utf-8")
-    df_sol = pd.read_csv(solidifi_csv, encoding="utf-8")
-
-    print(f"  SmartBugs Wild   : {len(df_sb):>6,} funciones")
-    print(f"  Slither Audited  : {len(df_sl):>6,} funciones")
-    print(f"  SolidiFI         : {len(df_sol):>6,} funciones")
-    print(f"  Total inputs     : {len(df_sb) + len(df_sl) + len(df_sol):>6,}")
-
-    # Verificar columnas requeridas
-    required = {"function_code", "vulnerability"}
-    for name, df in [("SmartBugs", df_sb), ("Slither", df_sl), ("SolidiFI", df_sol)]:
-        missing = required - set(df.columns)
-        if missing:
-            print(f"\n[ERROR] {name} le faltan columnas: {missing}")
-            sys.exit(1)
-
-    # Normalizar formato de código antes del dedup y guardado
-    print("\n[1b/4] Normalizando formato de código...")
-    for df in [df_sb, df_sl, df_sol]:
-        df["function_code"] = df["function_code"].apply(normalize_function_code)
-
-    # ----------------------------------------------------------------- test
-    print("\n[2/4] Construyendo test set (SolidiFI, sin dedup)...")
-    test_df = df_sol.copy().reset_index(drop=True)
-
-    print(f"  Test : {len(test_df):,} funciones")
-    print("  Distribución test:")
-    vc = test_df["vulnerability"].value_counts()
-    for vuln in VULN_CLASSES:
-        n = vc.get(vuln, 0)
-        print(f"    {vuln:<30}: {n:>5,}  ({100 * n / len(test_df):.1f}%)")
-
-    # ----------------------------------------------------------------- train
-    print("\n[3/4] Construyendo train set (SmartBugs + Slither Audited)...")
-
-    # Hashes de SmartBugs — base de referencia, se mantiene completo
-    print("  Computando hashes SmartBugs Wild...")
-    t0 = time.time()
-    df_sb["_hash"] = df_sb["function_code"].apply(_hash)
-    sb_hashes = set(df_sb["_hash"])
-    print(f"  {len(sb_hashes):,} hashes únicos ({time.time() - t0:.1f}s)")
-
-    # Dedup cross-dataset: eliminar de Slither lo que ya está en SmartBugs
-    print("  Computando hashes Slither Audited...")
-    t0 = time.time()
-    df_sl["_hash"] = df_sl["function_code"].apply(_hash)
-    print(f"  {len(set(df_sl['_hash'])):,} hashes únicos Slither ({time.time() - t0:.1f}s)")
-
-    n_before = len(df_sl)
-    df_sl_dedup = df_sl[~df_sl["_hash"].isin(sb_hashes)].copy()
-    n_removed = n_before - len(df_sl_dedup)
-
-    print(f"\n  Slither Audited antes dedup : {n_before:,}")
-    print(f"  Duplicados eliminados       : {n_removed:,}  ({100 * n_removed / n_before:.1f}%)")
-    print(f"  Slither Audited final       : {len(df_sl_dedup):,}")
-
-    # Solapamiento informacional SolidiFI → train (no se filtra)
-    sol_hashes = set(df_sol["function_code"].apply(_hash))
-    train_hashes = sb_hashes | set(df_sl_dedup["_hash"])
-    overlap = len(sol_hashes & train_hashes)
-    print(
-        f"\n  Solapamiento test → train   : {overlap} funciones ({100 * overlap / len(sol_hashes):.1f}%) — informacional, no filtrado"
-    )
-
-    # Concatenar train
-    train_df = pd.concat(
-        [
-            df_sb.drop(columns=["_hash"]),
-            df_sl_dedup.drop(columns=["_hash"]),
-        ],
-        ignore_index=True,
-    )
-
-    print(f"\n  Train total: {len(train_df):,} funciones")
-    print("  Distribución train:")
-    vc_train = train_df["vulnerability"].value_counts()
-    for vuln in VULN_CLASSES:
-        n = vc_train.get(vuln, 0)
-        pct = 100 * n / len(train_df)
-        bar = "█" * int(pct / 2)
-        print(f"    {vuln:<30}: {n:>6,}  ({pct:5.1f}%)  {bar}")
-
-    # ----------------------------------------------------------------- guarda
-    print("\n[4/4] Guardando...")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    train_path = out_dir / "train_functions.csv"
-    test_path = out_dir / "test_functions.csv"
-
-    train_df.to_csv(train_path, index=False, encoding="utf-8")
-    test_df.to_csv(test_path, index=False, encoding="utf-8")
-
-    elapsed = time.time() - t_total
-    print(f"  Guardado: {train_path}  ({len(train_df):,} filas)")
-    print(f"  Guardado: {test_path}   ({len(test_df):,} filas)")
-    print(f"  Tiempo total: {elapsed:.1f}s")
-
-    return train_df, test_df, elapsed
+def check_txorigin_label(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """Elimina snippets con 'tx.origin' cuya etiqueta no es tx.origin."""
+    has_txo = df["function_code"].apply(lambda c: "tx.origin" in str(c))
+    mask_bad = has_txo & (df["vulnerability"] != "tx.origin")
+    removed = int(mask_bad.sum())
+    if removed:
+        print(f"[{name}] 'tx.origin' en etiqueta distinta a tx.origin: -{removed:,}")
+    return df[~mask_bad].reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# Env report (opcional)
-# ---------------------------------------------------------------------------
+def check_timestamp_label(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """Elimina snippets con uso de timestamp (block.timestamp / now) cuya
+    etiqueta no es Timestamp-Dependency."""
+    has_ts = df["function_code"].apply(lambda c: bool(_TIMESTAMP_RE.search(str(c))))
+    mask_bad = has_ts & (df["vulnerability"] != "Timestamp-Dependency")
+    removed = int(mask_bad.sum())
+    if removed:
+        print(f"[{name}] uso de timestamp en etiqueta distinta a Timestamp-Dependency: -{removed:,}")
+    return df[~mask_bad].reset_index(drop=True)
 
 
-def generate_env_report(train_path: Path, test_path: Path, processing_time_s: float):
-    """Documenta el entorno del split en ENV_REPORT."""
-    sys.path.insert(0, str(_HERE / ".."))
-    from env_info import capture_env, save_report
-
-    info = capture_env(csv_output_path=str(train_path))
-    info["pipeline_processing_time_s"] = round(processing_time_s, 2)
-    info["test_csv"] = {"path": str(test_path.resolve())}
-    try:
-        df_t = pd.read_csv(test_path)
-        info["test_csv"]["rows"] = len(df_t)
-        info["test_csv"]["vuln_counts"] = df_t["vulnerability"].value_counts().to_dict()
-    except Exception:
-        pass
-
-    save_report(info, str(ENV_REPORT))
-    print(f"  Env report: {ENV_REPORT}")
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+def run_validations(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """Ejecuta las validaciones sobre df. Comentar una línea desactiva esa validación."""
+    df = check_starts_with_function(df, name)
+    df = check_balanced_braces(df, name)
+    df = check_txorigin_label(df, name)
+    df = check_timestamp_label(df, name)
+    return df
 
 
 def main():
-    print("=" * 60)
-    print("Dataset Split Builder")
-    print("Train : SmartBugs Wild + Slither Audited (cross-dataset hash dedup)")
-    print("Test  : SolidiFI (sin hash dedup)")
-    print("=" * 60)
-    print(f"SmartBugs : {SMARTBUGS_CSV}")
-    print(f"Slither   : {SLITHER_CSV}")
-    print(f"SolidiFI  : {SOLIDIFI_CSV}")
-    print(f"Salida    : {OUT_DIR}")
+    df_sb = pd.read_csv(SMARTBUGS_CSV, encoding="utf-8")
+    df_sl = pd.read_csv(SLITHER_CSV, encoding="utf-8")
+    df_sol = pd.read_csv(SOLIDIFI_CSV, encoding="utf-8")
+    print(f"SmartBugs: {len(df_sb):,} | Slither: {len(df_sl):,} | SolidiFI: {len(df_sol):,}")
 
-    for path, name in [
-        (SMARTBUGS_CSV, "SmartBugs"),
-        (SLITHER_CSV, "Slither"),
-        (SOLIDIFI_CSV, "SolidiFI"),
-    ]:
-        if not path.exists():
-            print(f"\n[ERROR] No encontrado: {path}")
-            print(f"  Ejecutá primero make{name}.py correspondiente.")
-            sys.exit(1)
+    # Test = SolidiFI completo
+    test_df = df_sol.reset_index(drop=True)
 
-    train_df, test_df, elapsed = build_datasets(SMARTBUGS_CSV, SLITHER_CSV, SOLIDIFI_CSV, OUT_DIR)
+    # Dedup 1: eliminar de Slither lo que ya esta en SmartBugs
+    sb_hashes = set(df_sb["function_code"].apply(code_hash))
+    sl_hash = df_sl["function_code"].apply(code_hash)
+    df_sl_dedup = df_sl[~sl_hash.isin(sb_hashes)]
+    print(f"Dedup Slither vs SmartBugs: -{len(df_sl) - len(df_sl_dedup):,} funciones")
 
-    print("\nGenerando env_report...")
-    generate_env_report(
-        train_path=OUT_DIR / "train_functions.csv",
-        test_path=OUT_DIR / "test_functions.csv",
-        processing_time_s=elapsed,
-    )
+    # Dedup 2: eliminar de train lo que aparece en test (data leakage)
+    train_df = pd.concat([df_sb, df_sl_dedup], ignore_index=True)
+    test_hashes = set(test_df["function_code"].apply(code_hash))
+    train_hash = train_df["function_code"].apply(code_hash)
+    n_before = len(train_df)
+    train_df = train_df[~train_hash.isin(test_hashes)].reset_index(drop=True)
+    print(f"Dedup Test -> Train:        -{n_before - len(train_df):,} funciones")
 
-    print("\n" + "=" * 60)
-    print("Completado.")
-    print(f"  train_functions.csv : {len(train_df):,} funciones")
-    print(f"  test_functions.csv  : {len(test_df):,} funciones")
-    print("=" * 60)
+    # Validaciones post-split (comentar una línea desactiva ese dataset)
+    print("\nValidaciones:")
+    train_df = run_validations(train_df, "TRAIN")
+    test_df = run_validations(test_df, "TEST")
+
+    train_df["id"] = range(len(train_df))
+    test_df["id"] = range(len(test_df))
+    train_df.to_csv(TRAIN_CSV, index=False, encoding="utf-8")
+    test_df.to_csv(TEST_CSV, index=False, encoding="utf-8")
+
+    for name, df in (("TRAIN", train_df), ("TEST", test_df)):
+        print(f"\n{name}: {len(df):,} funciones")
+        print(df["vulnerability"].value_counts().to_string())
+    print(f"\nGuardado: {TRAIN_CSV}\nGuardado: {TEST_CSV}")
 
 
 if __name__ == "__main__":

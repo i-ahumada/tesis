@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "statusMessage": "Ejecutando ruff (format + fix)...",
+            "command": "f=$(uv run --no-project python -c \"import sys,json; d=json.load(sys.stdin); print(d.get('tool_input',{}).get('file_path') or (d.get('tool_response') or {}).get('filePath') or '')\" 2>/dev/null); case \"$f\" in *.py) uvx ruff@0.15.13 format \"$f\"; uvx ruff@0.15.13 check --fix \"$f\";; esac; true"
+          }
+        ]
+      }
+    ]
+  }
+}

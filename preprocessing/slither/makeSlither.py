@@ -1,174 +1,81 @@
-# -*- coding: utf-8 -*-
 """
-makeSlither.py
-------------------------------------
-Extrae funciones vulnerables del dataset "Slither Audited Smart Contracts"
-(mwritescode/slither-audited-smart-contracts) para las 4 vulnerabilidades
-objetivo, replicando la metodologia del paper:
+makeSlither.py — Extrae funciones vulnerables del dataset Slither-Audited
+(mwritescode/slither-audited-smart-contracts, parquets en data/).
 
-  "Deep learning-based solution for smart contract vulnerabilities detection"
-  (Tang et al., Scientific Reports 2023, doi:10.1038/s41598-023-47219-0)
+Decisiones de diseño:
+- Se procesan TODOS los contratos con Slither, sin prefiltro por los resultados
+  precomputados del dataset (ese prefiltro omitía el detector timestamp).
+- Paralelismo con ThreadPoolExecutor y un worker por CPU: el trabajo pesado corre
+  en el subproceso slither/solc, por lo que el GIL no es cuello de botella.
+- Detectores según la Tabla 1 del paper (Tang et al. 2023), sin filtro por confianza.
+- Normalización ANTES de ejecutar Slither: comentarios eliminados y código
+  re-indentado con jsbeautifier. Así las líneas que reporta Slither corresponden
+  al mismo texto del que se extraen las funciones.
+- Filtro de contrato principal: se conservan los hallazgos cuya función pertenece
+  al contrato principal o a su cadena de herencia — el código escrito por el
+  programador. El principal se identifica como el `contract` con la clausura de
+  herencia más grande (más robusto que "el último declarado", que a veces es un
+  helper). Se descartan libraries y contratos auxiliares no heredados (SafeMath,
+  interfaces sueltas, etc.) pegados en el mismo source_code.
+- Dedup: (contrato, función, vulnerabilidad) y hash SHA-256 global del código.
+- Corrida única, sin checkpoint (decisión acordada).
 
-Pipeline:
-  1. CARGA    : Lee los Parquet de data/raw/ (120,608 contratos).
-                Columnas relevantes: contracts (address), source_code, results.
-
-  2. PREFILTRO: Usa la columna `results` (analisis Slither pre-computado en el
-                dataset, sin source_mapping) para descartar contratos donde
-                ninguno de nuestros detectores objetivo reporto un hallazgo.
-                Reduce ~52%% los contratos a analizar (57,884 candidatos).
-
-                Nota: el detector `timestamp` NO esta en los resultados pre-
-                computados. Los contratos con SOLO Timestamp-Dependency no seran
-                incluidos. Cobertura de esa categoria proviene de SmartBugs Wild.
-
-  3. SLITHER  : Para cada candidato:
-                a. Patch minimo de sintaxis para compatibilidad con solc 0.8.17
-                   (pragma -> ^0.8.0, .call.value, now, throw, suicide, etc.).
-                   Ninguna transformacion agrega ni elimina lineas.
-                b. Escribe source parcheado en .sol temporal.
-                c. Ejecuta Slither con detectores objetivo y --solc solc-0.8.17.
-                d. Parsea el JSON de salida completo (con source_mapping).
-
-  4. EXTRAE   : Por cada hallazgo:
-                - Busca el element de tipo "function" para obtener rango de lineas.
-                - Extrae el codigo del source ORIGINAL (no el parcheado).
-                - Dedup intra-contrato: (address, funcion, vuln).
-                - Dedup global: SHA-256 del codigo normalizado.
-
-  5. GUARDA   : CSV con columnas estandar:
-                id, contract_file, vulnerability, function_name,
-                function_code, dataset='slither_audited'
-
-Detectores usados:
-  Re-entrancy        -> reentrancy-eth, reentrancy-no-eth
-  Timestamp-Dep.     -> timestamp  (cobertura parcial, ver nota en paso 2)
-  Unhandled-Except.  -> unchecked-lowlevel, unchecked-send, unused-return
-  tx.origin          -> tx-origin
-
-Descarga del dataset:
-  python -c "
-  from huggingface_hub import snapshot_download
-  snapshot_download('mwritescode/slither-audited-smart-contracts',
-      repo_type='dataset', local_dir='datasets/slither-audited',
-      allow_patterns=['data/raw/*.parquet','data/label_mappings.json'])
-  "
-
-Uso:
-  python makeSlither.py --parquet_dir datasets/slither-audited
-                        --output func_dataset/slither_functions.csv
-
-  # Prueba rapida con N contratos:
-  python makeSlither.py --parquet_dir datasets/slither-audited
-                        --output func_dataset/slither_functions.csv
-                        --max_contracts 100
-
-Prerequisitos:
-  pip install slither-analyzer pandas pyarrow
-  solc-select install 0.8.17
+Uso: python makeSlither.py
+Requisitos: pip install slither-analyzer pandas pyarrow jsbeautifier packaging
+            solc-select install <versiones>
 """
 
-import glob
 import hashlib
 import json
 import os
 import re
 import subprocess
-import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import jsbeautifier
 import pandas as pd
 from packaging.version import Version
 
-# ---------------------------------------------------------------------------
-# Configuracion
-# ---------------------------------------------------------------------------
-
 DETECTORS_BY_VULN = {
-    "Re-entrancy": ["reentrancy-eth", "reentrancy-no-eth"],
+    "Re-entrancy": ["reentrancy-eth", "reentrancy-no-eth", "reentrancy-unlimited-gas", "reentrancy-benign"],
     "Timestamp-Dependency": ["timestamp"],
-    "Unhandled-Exceptions": ["unchecked-lowlevel", "unchecked-send", "unused-return"],
+    "Unhandled-Exceptions": ["unchecked-lowlevel", "unchecked-send"],
     "tx.origin": ["tx-origin"],
 }
-
 DETECTOR_TO_VULN = {det: vuln for vuln, dets in DETECTORS_BY_VULN.items() for det in dets}
+ALL_DETECTORS = ",".join(DETECTOR_TO_VULN)
 
-ALL_DETECTORS = ",".join(d for dets in DETECTORS_BY_VULN.values() for d in dets)
-
-# ---------------------------------------------------------------------------
-# Rutas (sin argumentos — ajustar si se mueve el dataset)
-# ---------------------------------------------------------------------------
 _HERE = Path(__file__).parent
 PARQUET_DIR = _HERE / "data"
 OUTPUT_CSV = _HERE / "slither_functions.csv"
-ENV_REPORT = _HERE / "env_report_slither.json"
+DATASET_NAME = "slither_audited"
 
-# Detectores presentes en los resultados pre-computados del dataset.
-# 'timestamp' tiene 0 ocurrencias en todo el dataset -> no se usa para prefiltro.
-_PRECOMPUTED_DETECTORS = {
-    "reentrancy-eth",
-    "reentrancy-no-eth",
-    "unchecked-lowlevel",
-    "unchecked-send",
-    "unused-return",
-    "tx-origin",
-}
+WORKERS = os.cpu_count() or 4
+SLITHER_TIMEOUT = 120
+
+_BEAUTIFY_OPTS = jsbeautifier.default_options()
+_BEAUTIFY_OPTS.indent_size = 4
 
 # ---------------------------------------------------------------------------
-# Deteccion de version solc y limpieza de comentarios
-# (duplicado de makeSmartbugs.py para que el script sea autocontenido)
+# Seleccion de solc por pragma
 # ---------------------------------------------------------------------------
 
-_SOLC_ARTIFACTS = os.path.join(os.path.expanduser("~"), ".solc-select", "artifacts")
-_INSTALLED_SOLC = [
-    "0.8.17",
-    "0.8.13",
-    "0.8.12",
-    "0.8.11",
-    "0.8.10",
-    "0.8.9",
-    "0.8.7",
-    "0.8.6",
-    "0.8.4",
-    "0.8.3",
-    "0.8.2",
-    "0.8.0",
-    "0.7.6",
-    "0.7.5",
-    "0.7.4",
-    "0.7.0",
-    "0.6.12",
-    "0.6.11",
-    "0.6.7",
-    "0.6.6",
-    "0.6.2",
-    "0.6.0",
-    "0.5.17",
-    "0.5.16",
-    "0.5.0",
-    "0.4.26",
-    "0.4.25",
-    "0.4.24",
-    "0.4.23",
-    "0.4.21",
-    "0.4.19",
-    "0.4.18",
-]
+_SOLC_ARTIFACTS = Path.home() / ".solc-select" / "artifacts"
+_INSTALLED_SOLC = sorted(
+    (p.name.removeprefix("solc-") for p in _SOLC_ARTIFACTS.glob("solc-*")),
+    key=Version,
+    reverse=True,
+)
 _PRAGMA_RE = re.compile(r"pragma\s+solidity\s+([^;]+);")
 
 
-def _solc_bin(version: str) -> str:
-    return os.path.join(_SOLC_ARTIFACTS, f"solc-{version}", f"solc-{version}")
-
-
-def _parse_constraints(pragma_str: str):
+def _parse_constraints(pragma_str: str) -> list:
+    """Convierte el pragma en lista de (operador, version)."""
     constraints = []
-    for part in pragma_str.strip().split():
-        part = part.strip()
-        if not part:
-            continue
+    for part in pragma_str.split():
         if part.startswith("^"):
             ver = part[1:]
             segs = ver.split(".")
@@ -177,14 +84,10 @@ def _parse_constraints(pragma_str: str):
             except (IndexError, ValueError):
                 upper = "99.0.0"
             constraints += [(">=", ver), ("<", upper)]
-        elif part.startswith(">="):
-            constraints.append((">=", part[2:]))
-        elif part.startswith(">"):
-            constraints.append((">", part[1:]))
-        elif part.startswith("<="):
-            constraints.append(("<=", part[2:]))
-        elif part.startswith("<"):
-            constraints.append(("<", part[1:]))
+        elif part[:2] in (">=", "<="):
+            constraints.append((part[:2], part[2:]))
+        elif part[0] in (">", "<"):
+            constraints.append((part[0], part[1:]))
         elif part.startswith("="):
             constraints.append(("==", part[1:]))
         elif re.match(r"^\d", part):
@@ -192,10 +95,19 @@ def _parse_constraints(pragma_str: str):
     return constraints
 
 
-def detect_solc_version(source: str) -> str:
-    """Retorna el path al binario solc mas adecuado para el pragma del contrato."""
+_OPS = {
+    ">=": lambda a, b: a >= b,
+    ">": lambda a, b: a > b,
+    "<=": lambda a, b: a <= b,
+    "<": lambda a, b: a < b,
+    "==": lambda a, b: a == b,
+}
+
+
+def detect_solc_bin(source: str) -> str:
+    """Path al binario solc instalado mas nuevo que satisface el pragma."""
+    fallback = str(_SOLC_ARTIFACTS / "solc-0.5.17" / "solc-0.5.17")
     m = _PRAGMA_RE.search(source)
-    fallback = _solc_bin("0.5.17")
     if not m:
         return fallback
     constraints = _parse_constraints(m.group(1))
@@ -203,112 +115,72 @@ def detect_solc_version(source: str) -> str:
         return fallback
     for v in _INSTALLED_SOLC:
         try:
-            pv = Version(v)
-            ok = all(
-                (op == ">=" and pv >= Version(b))
-                or (op == ">" and pv > Version(b))
-                or (op == "<=" and pv <= Version(b))
-                or (op == "<" and pv < Version(b))
-                or (op == "==" and pv == Version(b))
-                for op, b in constraints
-            )
-            if ok:
-                bin_path = _solc_bin(v)
-                if os.path.exists(bin_path):
-                    return bin_path
+            if all(_OPS[op](Version(v), Version(bound)) for op, bound in constraints):
+                return str(_SOLC_ARTIFACTS / f"solc-{v}" / f"solc-{v}")
         except Exception:
             continue
     return fallback
 
 
+# ---------------------------------------------------------------------------
+# Normalizacion y Slither
+# ---------------------------------------------------------------------------
+
+
 def strip_comments(source: str) -> str:
     """Elimina // y /* */ preservando los saltos de linea."""
-
-    def replace_block(m):
-        return "\n" * m.group(0).count("\n")
-
-    source = re.sub(r"/\*.*?\*/", replace_block, source, flags=re.DOTALL)
-    source = re.sub(r"//[^\n]*", "", source)
-    return source
+    source = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), source, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", "", source)
 
 
-def get_last_contract_name(src_code: str) -> str | None:
-    """Retorna el nombre del ultimo contract/library declarado en el source."""
-    matches = re.findall(r"\b(?:library|contract)\s+(\w+)", src_code)
-    return matches[-1] if matches else None
+def normalize_source(source: str) -> str:
+    return strip_comments(jsbeautifier.beautify(source, _BEAUTIFY_OPTS))
 
 
-# ---------------------------------------------------------------------------
-# Carga del dataset
-# ---------------------------------------------------------------------------
+_DECL_RE = re.compile(r"\b(contract|interface|library)\s+(\w+)(\s+is\s+[^{]+)?")
 
 
-def load_parquets(parquet_dir: str) -> pd.DataFrame:
+def main_contract_names(src_code: str) -> set:
+    """Nombres del contrato principal y de toda su cadena de herencia.
+
+    El principal es el `contract` con la clausura de herencia mas grande
+    (empate: el declarado mas al final). Ese criterio es mas robusto que tomar
+    el ultimo declarado, que a veces es un helper y no el contrato principal.
+    Quedan fuera las libraries y los contratos no heredados.
+    Set vacio = no filtrar (no se encontro ningun contract).
     """
-    Carga todos los .parquet bajo parquet_dir (recursivo) y los concatena.
-    """
-    files = sorted(glob.glob(os.path.join(parquet_dir, "**", "*.parquet"), recursive=True))
-    if not files:
-        raise FileNotFoundError(
-            f"No se encontraron .parquet en: {parquet_dir}\n"
-            "Descargalos con snapshot_download (ver docstring del modulo)."
-        )
-    print(f"  {len(files)} archivo(s) Parquet:")
-    frames = []
-    for f in files:
-        df_part = pd.read_parquet(f)
-        print(f"    {os.path.basename(f):35s} {len(df_part):>7,} contratos")
-        frames.append(df_part)
-    return pd.concat(frames, ignore_index=True)
+    decls = _DECL_RE.findall(src_code)
+    bases = {name: (re.findall(r"\w+", is_clause)[1:] if is_clause else []) for _, name, is_clause in decls}
 
+    def closure(root: str) -> set:
+        keep, stack = set(), [root]
+        while stack:
+            name = stack.pop()
+            if name in keep or name not in bases:
+                continue
+            keep.add(name)
+            stack.extend(bases[name])
+        return keep
 
-# ---------------------------------------------------------------------------
-# Prefiltro por resultados pre-computados
-# ---------------------------------------------------------------------------
-
-
-def _precomputed_detectors(results_str) -> set:
-    """
-    Parsea la columna `results` (JSON string) y retorna el conjunto de
-    detectores que reportaron hallazgos.
-    """
-    try:
-        data = json.loads(str(results_str))
-        return {d["check"] for d in data.get("results", {}).get("detectors", [])}
-    except Exception:
+    contracts = [name for kind, name, _ in decls if kind == "contract"]
+    if not contracts:
         return set()
+    return max((closure(c) for c in reversed(contracts)), key=len)
 
 
-def is_candidate(results_str) -> bool:
+def run_slither(src_normalized: str, solc_bin: str, keep_contracts: set) -> list:
     """
-    True si el analisis pre-computado contiene al menos uno de nuestros
-    detectores objetivo (excepto timestamp, que no esta en el dataset).
+    Ejecuta Slither sobre el texto normalizado y retorna
+    [(detector, nombre_funcion, linea_inicio, linea_fin)]. Vacio si falla.
+
+    Si keep_contracts no esta vacio, descarta hallazgos cuya funcion no
+    pertenece a esos contratos (filtra libraries y contratos auxiliares).
     """
-    return bool(_precomputed_detectors(results_str) & _PRECOMPUTED_DETECTORS)
-
-
-# ---------------------------------------------------------------------------
-# Ejecucion de Slither
-# ---------------------------------------------------------------------------
-
-
-def run_slither(source: str, last_contract_name: str = None) -> list[dict]:
-    """
-    Escribe el source completo (con comentarios eliminados) en un .sol temporal,
-    ejecuta Slither y retorna lista de findings del ultimo contrato:
-        [{check, function_name, func_start_line, func_end_line, bug_line}, ...]
-
-    Si last_contract_name se provee, solo incluye hallazgos cuya funcion
-    pertenece a ese contrato. Retorna lista vacia si no hay hallazgos o Slither falla.
-    """
-    src_clean = strip_comments(source)
-    solc_bin = detect_solc_version(source)
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".sol", mode="w", delete=False, encoding="utf-8") as tmp:
-            tmp.write(src_clean)
+            tmp.write(src_normalized)
             tmp_path = tmp.name
-
         cmd = [
             "slither",
             tmp_path,
@@ -322,245 +194,102 @@ def run_slither(source: str, last_contract_name: str = None) -> list[dict]:
             "--solc-disable-warnings",
             "--disable-color",
         ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=SLITHER_TIMEOUT)
         if not result.stdout.strip():
             return []
-
-        data = json.loads(result.stdout)
-        detectors = data.get("results", {}).get("detectors", [])
-        if not detectors:
-            return []
-
         findings = []
-        for det in detectors:
-            check = det.get("check", "")
+        for det in json.loads(result.stdout).get("results", {}).get("detectors", []):
+            check = det.get("check")
             if check not in DETECTOR_TO_VULN:
                 continue
-
-            elements = det.get("elements", [])
-
-            func_el = next((e for e in elements if e.get("type") == "function"), None)
+            func_el = next((e for e in det.get("elements", []) if e.get("type") == "function"), None)
             if not func_el:
                 continue
-
-            if last_contract_name:
+            if keep_contracts:
                 parent = func_el.get("type_specific_fields", {}).get("parent", {})
-                if parent.get("name") != last_contract_name:
+                if parent.get("name") not in keep_contracts:
                     continue
-
-            func_lines = func_el.get("source_mapping", {}).get("lines", [])
-            if not func_lines:
+            lines = func_el.get("source_mapping", {}).get("lines", [])
+            if not lines:
                 continue
-
-            node_el = next((e for e in elements if e.get("type") == "node"), None)
-            bug_line = None
-            if node_el:
-                node_lines = node_el.get("source_mapping", {}).get("lines", [])
-                if node_lines:
-                    bug_line = min(node_lines)
-
-            findings.append(
-                {
-                    "check": check,
-                    "function_name": func_el.get("name", ""),
-                    "func_start_line": min(func_lines),
-                    "func_end_line": max(func_lines),
-                    "bug_line": bug_line,
-                }
-            )
-
+            findings.append((check, func_el.get("name", ""), min(lines), max(lines)))
         return findings
-
-    except subprocess.TimeoutExpired:
-        return []
-    except (json.JSONDecodeError, Exception):
+    except Exception:
         return []
     finally:
-        if tmp_path and os.path.exists(tmp_path):
+        if tmp_path:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
 
 
-# ---------------------------------------------------------------------------
-# Extraccion de codigo de funcion
-# ---------------------------------------------------------------------------
-
-
-def extract_function_code(source: str, start_line: int, end_line: int) -> str:
-    """Extrae las lineas [start_line, end_line] del source original (1-indexed)."""
-    lines = source.splitlines()
-    start = max(0, start_line - 1)
-    end = min(len(lines), end_line)
-    return "\n".join(lines[start:end])
-
-
-# ---------------------------------------------------------------------------
-# Pipeline principal
-# ---------------------------------------------------------------------------
-
-
-def build_slither_functions_dataset(
-    df_raw: pd.DataFrame,
-    max_contracts: int = None,
-    verbose: bool = False,
-) -> pd.DataFrame:
-    """
-    Pipeline: prefiltro -> Slither -> extraccion -> dedup -> DataFrame.
-    """
-    # Validar columnas
-    for col in ("source_code", "results"):
-        if col not in df_raw.columns:
-            raise ValueError(f"Columna requerida ausente: '{col}'")
-
-    has_address = "contracts" in df_raw.columns
-
-    # Prefiltro
-    print("\n[2/4] Prefiltro por resultados pre-computados...")
-    mask = df_raw["results"].apply(is_candidate)
-    df_candidates = df_raw[mask].reset_index(drop=True)
-    n_total = len(df_raw)
-    n_candidates = len(df_candidates)
-    print(f"  Total contratos      : {n_total:>8,}")
-    print(f"  Candidatos           : {n_candidates:>8,}  ({100 * n_candidates / max(n_total, 1):.1f}%)")
-
-    if max_contracts:
-        df_candidates = df_candidates.head(max_contracts)
-        print(f"  Limitado a           : {len(df_candidates):>8,}  (--max_contracts)")
-
-    # Slither + extraccion
-    print("\n[3/4] Ejecutando Slither y extrayendo funciones...")
-
+def process_contract(address: str, source: str) -> list:
+    """Normaliza, corre Slither y retorna las filas (sin dedup global)."""
+    src_norm = normalize_source(source)
+    src_lines = src_norm.splitlines()
+    keep_contracts = main_contract_names(src_norm)
     rows = []
-    seen_local: set[tuple] = set()
-    seen_hashes: set[str] = set()
-    stats = {
-        "sin_source": 0,
-        "sin_hallazgos": 0,
-        "con_hallazgos": 0,
-        "por_vuln": {v: 0 for v in DETECTORS_BY_VULN},
-    }
-    row_id = 0
-    n = len(df_candidates)
-
-    for i, (_, row) in enumerate(df_candidates.iterrows(), 1):
-        source = str(row.get("source_code") or "")
-        address = str(row.get("contracts", f"row_{i}")) if has_address else f"row_{i}"
-
-        if verbose:
-            print(f"  [{i:6d}/{n}] {address[:40]}")
-        elif i % 100 == 0 or i == n:
-            print(f"  Procesados: {i:,}/{n:,} | hallazgos: {stats['con_hallazgos']:,}", end="\r")
-
-        if not source.strip() or source.strip() in ("nan", "None"):
-            stats["sin_source"] += 1
-            continue
-
-        last_contract_name = get_last_contract_name(source)
-        findings = run_slither(source, last_contract_name=last_contract_name)
-
-        if not findings:
-            stats["sin_hallazgos"] += 1
-            continue
-
-        stats["con_hallazgos"] += 1
-
-        for f in findings:
-            check = f["check"]
-            vuln = DETECTOR_TO_VULN[check]
-
-            func_code = extract_function_code(source, f["func_start_line"], f["func_end_line"])
-            if not func_code.strip():
-                continue
-
-            # Dedup intra-contrato
-            key_local = (address, f["function_name"], vuln)
-            if key_local in seen_local:
-                continue
-            seen_local.add(key_local)
-
-            # Dedup global por hash
-            normalized = re.sub(r"\s+", " ", func_code.strip())
-            h = hashlib.sha256(normalized.encode()).hexdigest()
-            if h in seen_hashes:
-                continue
-            seen_hashes.add(h)
-
+    for check, func_name, start, end in run_slither(src_norm, detect_solc_bin(source), keep_contracts):
+        code = "\n".join(ln for ln in src_lines[max(0, start - 1) : min(len(src_lines), end)] if ln.strip())
+        if code:
             rows.append(
                 {
-                    "id": row_id,
                     "contract_file": address,
-                    "vulnerability": vuln,
-                    "function_name": f["function_name"],
-                    "function_code": func_code.strip(),
-                    "dataset": "slither_audited",
+                    "vulnerability": DETECTOR_TO_VULN[check],
+                    "function_name": func_name,
+                    "function_code": code,
+                    "dataset": DATASET_NAME,
                 }
             )
-            row_id += 1
-            stats["por_vuln"][vuln] += 1
+    return rows
 
-    print()
 
-    print("\n" + "=" * 60)
-    print("RESUMEN")
-    print("=" * 60)
-    print(f"  Sin codigo fuente        : {stats['sin_source']:>6,}")
-    print(f"  Sin hallazgos (Slither)  : {stats['sin_hallazgos']:>6,}")
-    print(f"  Con >= 1 hallazgo        : {stats['con_hallazgos']:>6,}")
-    print("\n  Funciones por vulnerabilidad:")
-    for vuln, count in stats["por_vuln"].items():
-        print(f"    {vuln:<30}: {count:>6,}")
-    total = sum(stats["por_vuln"].values())
-    print(f"    {'TOTAL':<30}: {total:>6,}")
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
 
+
+def dedup(results: list) -> pd.DataFrame:
+    """Dedup por (contrato, funcion, vuln) y por hash global del codigo."""
+    seen_local, seen_hashes, rows = set(), set(), []
+    for contract_rows in results:
+        for r in contract_rows or []:
+            key = (r["contract_file"], r["function_name"], r["vulnerability"])
+            h = hashlib.sha256(re.sub(r"\s+", " ", r["function_code"]).encode()).hexdigest()
+            if key in seen_local or h in seen_hashes:
+                continue
+            seen_local.add(key)
+            seen_hashes.add(h)
+            rows.append({"id": len(rows), **r})
     return pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
-
-
 def main():
-    t_start = time.time()
+    t0 = time.time()
+    parquets = sorted(PARQUET_DIR.glob("*.parquet"))
+    df_raw = pd.concat([pd.read_parquet(f, columns=["contracts", "source_code"]) for f in parquets], ignore_index=True)
 
-    print("=" * 60)
-    print("Slither Audited Smart Contracts - Functions Builder")
-    print("=" * 60)
-    print(f"Parquet dir   : {PARQUET_DIR}")
-    print(f"Output        : {OUTPUT_CSV}")
-    print(f"Detectores    : {ALL_DETECTORS}")
+    tasks = [
+        (str(row.contracts), str(row.source_code))
+        for row in df_raw.itertuples(index=False)
+        if str(row.source_code).strip() not in ("", "nan", "None")
+    ]
+    print(f"{len(df_raw):,} contratos cargados, {len(tasks):,} con codigo | {WORKERS} workers")
 
-    if not PARQUET_DIR.exists():
-        print(f"\n[ERROR] Dataset no encontrado: {PARQUET_DIR}")
-        sys.exit(1)
+    results = [None] * len(tasks)
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futures = {pool.submit(process_contract, addr, src): i for i, (addr, src) in enumerate(tasks)}
+        for done, future in enumerate(as_completed(futures), 1):
+            results[futures[future]] = future.result()
+            if done % 50 == 0 or done == len(tasks):
+                print(f"  {done:,}/{len(tasks):,} ({100 * done // len(tasks)}%)  {time.time() - t0:,.0f}s", end="\r")
+    print()
 
-    print("\n[1/4] Cargando Parquet...")
-    df_raw = load_parquets(str(PARQUET_DIR))
-    print(f"  {len(df_raw):,} contratos cargados | columnas: {list(df_raw.columns)}")
-
-    df_result = build_slither_functions_dataset(df_raw)
-
-    print("\n[4/4] Guardando resultado...")
-    if df_result.empty:
-        print("  No se encontraron funciones vulnerables.")
-        return
-
-    df_result.to_csv(OUTPUT_CSV, index=False, encoding="utf-8")
-    print(f"  Guardado: {OUTPUT_CSV} ({len(df_result):,} filas)")
-    print("\nDistribucion por vulnerabilidad:")
-    print(df_result["vulnerability"].value_counts().to_string())
-
-    elapsed = time.time() - t_start
-    sys.path.insert(0, str(_HERE.parent))
-    from env_info import capture_env, save_report
-
-    info = capture_env(csv_output_path=str(OUTPUT_CSV))
-    info["pipeline_processing_time_s"] = round(elapsed, 2)
-    save_report(info, str(ENV_REPORT))
+    df = dedup(results)
+    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8")
+    print(f"\nGuardado: {OUTPUT_CSV} ({len(df):,} filas, {time.time() - t0:,.0f}s)")
+    print(df["vulnerability"].value_counts().to_string())
 
 
 if __name__ == "__main__":
