@@ -17,7 +17,13 @@ Decisiones de diseño:
   herencia más grande (más robusto que "el último declarado", que a veces es un
   helper). Se descartan libraries y contratos auxiliares no heredados (SafeMath,
   interfaces sueltas, etc.) pegados en el mismo source_code.
+- Cada fila guarda tanto la categoria de vulnerabilidad (clave de
+  DETECTORS_BY_VULN, ej. "Unhandled-Exceptions") como el detector puntual de
+  Slither que la genero (columna `detector`, ej. "unchecked-lowlevel"), para
+  poder distinguir entre los detectores agrupados bajo una misma categoria.
 - Dedup: (contrato, función, vulnerabilidad) y hash SHA-256 global del código.
+  El detector no forma parte de la clave: si dos detectores de la misma
+  categoria coinciden en la misma función, se conserva solo el primero.
 - Corrida única, sin checkpoint (decisión acordada).
 
 Uso: python makeSlither.py
@@ -237,6 +243,7 @@ def process_contract(address: str, source: str) -> list:
                 {
                     "contract_file": address,
                     "vulnerability": DETECTOR_TO_VULN[check],
+                    "detector": check,
                     "function_name": func_name,
                     "function_code": code,
                     "dataset": DATASET_NAME,
